@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -41,6 +42,13 @@ Use --extract-content=false for a faster metadata-only scan, and
 		root := "."
 		if len(args) == 1 {
 			root = args[0]
+		}
+
+		// The scanner only embeds inside the extraction branch, so
+		// --embed with --extract-content=false embeds nothing. Warn
+		// instead of silently ignoring the flag.
+		if embedContent && !extractContent {
+			fmt.Fprintln(os.Stderr, "warning: --embed has no effect with --extract-content=false (nothing to embed)")
 		}
 
 		start := time.Now()
