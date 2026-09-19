@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/NoahMenezes/Delve/internal/db"
+	"github.com/NoahMenezes/Delve/internal/search"
 )
 
 // Flags for the search command. Package-level vars bound by pointer in
@@ -17,19 +19,26 @@ import (
 var (
 	searchLimit     int
 	searchExtension string
+	searchSemantic  bool
 )
 
 // searchCmd represents the search command
 var searchCmd = &cobra.Command{
 	Use:   "search [query]",
-	Short: "Keyword-search indexed file names, paths, and contents",
+	Short: "Search indexed files by keyword or by meaning",
 	Long: `Full-text search across indexed file names, paths, and
-extracted document content (txt/md/pdf/docx) using SQLite FTS5.
+extracted document content (txt/md/pdf/docx) using SQLite FTS5 —
+or, with --semantic, meaning-based search over local embeddings.
+
+Keyword finds exact matches (great for filename fragments);
+semantic finds related ideas with no shared words. Both run
+fully offline.
 
 Examples:
   delve search invoice
   delve search "quarterly report" --limit 5
-  delve search invoice --extension pdf`,
+  delve search invoice --extension pdf
+  delve search --semantic "documents about vacation planning"`,
 	// At least one word of query is required; multiple words are
 	// space-joined ("delve search quarterly report" just works).
 	Args: cobra.MinimumNArgs(1),
@@ -44,6 +53,13 @@ Examples:
 			return err
 		}
 		defer database.Close()
+
+		// Semantic search is additive, not a replacement: exact-match
+		// keyword search stays the default, --semantic routes to the
+		// embedding index for meaning-based ranking.
+		if searchSemantic {
+			return runSemanticSearch(database, query)
+		}
 
 		results, err := db.SearchFiles(database, query, searchLimit, searchExtension)
 		if err != nil {
@@ -62,6 +78,43 @@ Examples:
 		}
 		return nil
 	},
+}
+
+// runSemanticSearch executes the --semantic path: embed the query,
+// rank by cosine similarity, and print hits with their scores.
+func runSemanticSearch(database *sql.DB, query string) error {
+	hits, err := search.SemanticSearch(database, query, searchLimit)
+	if err != nil {
+		return fmt.Errorf("semantic search failed: %w", err)
+	}
+	if len(hits) == 0 {
+		fmt.Printf("No semantic results for %q.\n", query)
+		fmt.Println("Tip: semantic search needs embedded files — run `delve scan <dir>` (embedding is on by default).")
+		return nil
+	}
+	printSemanticResults(hits)
+	if len(hits) == searchLimit {
+		fmt.Printf("(showing first %d — narrow with --limit)\n", searchLimit)
+	}
+	return nil
+}
+
+// printSemanticResults renders meaning-ranked hits. Same table idiom
+// as keyword results, plus the SCORE column (cosine similarity,
+// higher = more similar) that makes semantic ranking interpretable.
+func printSemanticResults(hits []search.Hit) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "SCORE\tNAME\tSIZE\tMODIFIED\tPATH")
+	for _, h := range hits {
+		fmt.Fprintf(w, "%.3f\t%s\t%s\t%s\t%s\n",
+			h.Score,
+			h.Record.Name,
+			humanSize(h.Record.SizeBytes),
+			relativeTime(h.Record.ModifiedAt),
+			h.Record.Path,
+		)
+	}
+	w.Flush()
 }
 
 // printResults renders matches as an aligned table. tabwriter (stdlib)
@@ -130,4 +183,5 @@ func init() {
 
 	searchCmd.Flags().IntVar(&searchLimit, "limit", 20, "maximum number of results to show")
 	searchCmd.Flags().StringVar(&searchExtension, "extension", "", "filter by file extension (e.g. --extension pdf)")
+	searchCmd.Flags().BoolVar(&searchSemantic, "semantic", false, "search by meaning using local embeddings instead of keywords")
 }

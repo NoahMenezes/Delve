@@ -4,6 +4,7 @@
 package scanner
 
 import (
+	"database/sql"
 	"fmt"
 	"io/fs"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NoahMenezes/Delve/internal/db"
+	"github.com/NoahMenezes/Delve/internal/embed"
 	"github.com/NoahMenezes/Delve/internal/extract"
 )
 
@@ -34,21 +36,19 @@ var skipDirs = map[string]bool{
 	".delve":       true, // never index our own database directory
 }
 
+// ScanOptions bundles the per-phase scan flags. The signature grew
+// one boolean per phase (verbose, extractContent, now embed) until
+// positional bools became unreadable — this struct is the graduation
+// the Phase 3 comment promised. New phases add fields, not params.
+type ScanOptions struct {
+	Verbose        bool // print each indexed path instead of a counter
+	ExtractContent bool // Phase 3: extract txt/md/pdf/docx text
+	Embed          bool // Phase 4: embed extracted text for semantic search
+}
+
 // ScanDirectory walks root recursively and upserts every regular file
 // into the SQLite index. It returns how many files were indexed.
-//
-// The verbose flag controls per-file output: false prints just a
-// running count (one line, overwritten in place), true prints each
-// indexed path on its own line (useful for debugging, noisy at scale).
-// The extractContent flag enables Phase 3 text extraction for
-// supported formats (txt/md/pdf/docx) — disable it for faster
-// metadata-only scans of large trees.
-//
-// NOTE on the signature: it grows one flag per phase (verbose in
-// Phase 2, extractContent now) to keep call sites readable without an
-// options struct — a deliberate minimalism tradeoff; if a fourth flag
-// ever arrives, graduate to a ScanOptions struct.
-func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount int, err error) {
+func ScanDirectory(root string, opts ScanOptions) (fileCount int, err error) {
 	// Resolve early: filepath.WalkDir would otherwise report a
 	// confusing error deep inside the walk for a bad root.
 	info, err := os.Stat(root)
@@ -96,7 +96,7 @@ func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount in
 		// the entire subtree.
 		if entry.IsDir() {
 			if skipDirs[entry.Name()] {
-				if verbose {
+				if opts.Verbose {
 					fmt.Printf("skipping directory: %s\n", path)
 				}
 				return filepath.SkipDir
@@ -113,7 +113,7 @@ func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount in
 		// both skipped, so files reachable only via symlink are
 		// invisible to search until that feature lands.
 		if entry.Type()&fs.ModeSymlink != 0 {
-			if verbose {
+			if opts.Verbose {
 				fmt.Printf("skipping symlink: %s\n", path)
 			}
 			return nil
@@ -151,7 +151,7 @@ func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount in
 		// Failures record (nil content + timestamp) so the database
 		// distinguishes "tried and failed" from "not yet tried" and
 		// doesn't waste work retrying known-bad files every scan.
-		if extractContent && extract.IsSupported(rec.Extension) {
+		if opts.ExtractContent && extract.IsSupported(rec.Extension) {
 			text, err := extract.ExtractText(absPath, rec.Extension)
 			now := time.Now().Unix()
 			if err != nil {
@@ -162,14 +162,23 @@ func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount in
 			} else {
 				if uerr := db.UpdateFileContent(database, absPath, &text, now); uerr != nil {
 					fmt.Fprintf(os.Stderr, "warning: could not store content for %s: %v\n", path, uerr)
-				} else if verbose {
-					fmt.Printf("extracted content: %s (%d chars)\n", absPath, len([]rune(text)))
+				} else {
+					if opts.Verbose {
+						fmt.Printf("extracted content: %s (%d chars)\n", absPath, len([]rune(text)))
+					}
+					// Phase 4: embed freshly extracted text for semantic
+					// search. Empty text (e.g. scanned PDFs) has nothing
+					// to embed — skip it, but its extracted_at stamp
+					// stands so we don't retry every scan.
+					if opts.Embed && strings.TrimSpace(text) != "" {
+						embedFile(database, absPath, text, now, opts.Verbose)
+					}
 				}
 			}
 		}
 
 		fileCount++
-		if verbose {
+		if opts.Verbose {
 			fmt.Printf("indexed: %s\n", absPath)
 		} else {
 			// \r rewrites the same terminal line so a 100k-file
@@ -187,10 +196,38 @@ func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount in
 		return fileCount, fmt.Errorf("scan aborted: %w", err)
 	}
 
-	if !verbose {
+	if !opts.Verbose {
 		fmt.Println() // end the \r counter line cleanly
 	}
 	return fileCount, nil
+}
+
+// embedFile generates and stores a file's meaning vector. It first
+// asks the database whether an embedding newer than this content
+// already exists — rescans of unchanged files skip the (millisecond,
+// but nonzero) inference cost. Embed failures warn and continue: a
+// file without a vector is simply invisible to semantic search, still
+// fully searchable by keyword.
+func embedFile(database *sql.DB, absPath, text string, contentTs int64, verbose bool) {
+	fresh, err := db.EmbeddingStatus(database, absPath, contentTs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not check embedding status for %s: %v\n", absPath, err)
+	} else if fresh {
+		if verbose {
+			fmt.Printf("embedding fresh, skipping: %s\n", absPath)
+		}
+		return
+	}
+	vec, err := embed.GenerateEmbedding(text)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not embed %s: %v\n", absPath, err)
+		return
+	}
+	if err := db.UpsertEmbedding(database, absPath, vec, time.Now().Unix()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not store embedding for %s: %v\n", absPath, err)
+	} else if verbose {
+		fmt.Printf("embedded: %s (%d dims)\n", absPath, len(vec))
+	}
 }
 
 // toFileRecord converts a path + FileInfo into a db.FileRecord.

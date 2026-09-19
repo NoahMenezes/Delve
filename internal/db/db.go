@@ -7,7 +7,10 @@ package db
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +57,12 @@ type FileRecord struct {
 	//   nil, nil + unsupported extension = not applicable (by definition)
 	Content            *string
 	ContentExtractedAt *int64
+	// EmbeddedAt is the Unix time the file's content was last embedded
+	// (Phase 4+), nil when never embedded. Lives on `files` (not the
+	// embeddings table) so "what still needs embedding?" is answerable
+	// without touching any vector BLOBs — same pattern as
+	// ContentExtractedAt.
+	EmbeddedAt *int64
 }
 
 // DefaultDBPath returns ~/.delve/delve.db.
@@ -154,6 +163,10 @@ func createSchema(database *sql.DB) error {
 	if err := migrateContentColumns(database); err != nil {
 		return err
 	}
+	// Phase 4 embedding storage. Same one-path migration pattern.
+	if err := migrateEmbeddingSchema(database); err != nil {
+		return err
+	}
 	return ensureFTSSchema(database)
 }
 
@@ -179,6 +192,45 @@ func migrateContentColumns(database *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// migrateEmbeddingSchema adds Phase 4's vector storage. Vectors live in
+// a dedicated `embeddings` table rather than a BLOB column on `files`,
+// for one reason: row width. Metadata queries (counts, listings, FTS
+// joins) should never drag 1.5KB of floats per row through the pager;
+// the vectors are only read by the brute-force semantic scan, which
+// selects from this table directly. file_id mirrors files.id 1:1
+// (same integer, PRIMARY KEY on both sides) with no enforced FOREIGN
+// KEY — the codebase never enables SQLite's foreign_keys pragma, so a
+// declared FK would be decoration; integrity instead comes from a
+// single writer path (UpsertEmbedding touches both tables in one
+// transaction) plus scanner cleanup on Phase 6.
+//
+// VECTOR SERIALIZATION, explained: SQLite has no vector type, so a
+// []float32 becomes a BLOB of concatenated little-endian IEEE-754
+// bytes via encoding/binary — dim*4 bytes, 1536 for MiniLM-384.
+// Little-endian is arbitrary but must be consistent between
+// encodeVector and decodeVector; dim is stored alongside so a future
+// model change fails loudly on read instead of silently mis-scoring.
+func migrateEmbeddingSchema(database *sql.DB) error {
+	cols, err := tableColumns(database, "files")
+	if err != nil {
+		return err
+	}
+	if !cols["embedded_at"] {
+		if _, err := database.Exec(`ALTER TABLE files ADD COLUMN embedded_at INTEGER;`); err != nil {
+			return err
+		}
+	}
+	const table = `
+	CREATE TABLE IF NOT EXISTS embeddings (
+		file_id INTEGER PRIMARY KEY,
+		dim     INTEGER NOT NULL,
+		vector  BLOB NOT NULL
+	);
+	`
+	_, err = database.Exec(table)
+	return err
 }
 
 // tableColumns returns the current column set of a table via
@@ -384,7 +436,7 @@ func SearchFiles(database *sql.DB, query string, limit int, extension string) ([
 	SELECT
 		files.path, files.name, files.extension, files.size_bytes,
 		files.modified_at, files.created_at, files.indexed_at, files.content_hash,
-		files.content, files.content_extracted_at
+		files.content, files.content_extracted_at, files.embedded_at
 	FROM files_fts
 	JOIN files ON files.id = files_fts.rowid
 	WHERE files_fts MATCH ?
@@ -418,12 +470,148 @@ func SearchFiles(database *sql.DB, query string, limit int, extension string) ([
 			&rec.ContentHash,
 			&rec.Content,
 			&rec.ContentExtractedAt,
+			&rec.EmbeddedAt,
 		); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
 	}
 	return out, rows.Err()
+}
+
+// StoredEmbedding pairs a file's metadata with its decoded meaning
+// vector — the unit of work for the brute-force semantic scan.
+type StoredEmbedding struct {
+	Record FileRecord
+	Vector []float32
+}
+
+// UpsertEmbedding stores a file's embedding vector and stamps
+// embedded_at, looked up by path (the codebase's universal key —
+// callers never handle raw row ids). Both writes happen in one
+// transaction so a crash can't leave a vector without its timestamp
+// or vice versa. Re-embedding simply replaces the row.
+func UpsertEmbedding(database *sql.DB, path string, vector []float32, embeddedAt int64) error {
+	blob, err := encodeVector(vector)
+	if err != nil {
+		return err
+	}
+	tx, err := database.Begin()
+	if err != nil {
+		return err
+	}
+	// Rollback on any failure; committed explicitly below. The
+	// named-return dance isn't needed — inline handling is clearer.
+	_, err = tx.Exec(`
+		INSERT OR REPLACE INTO embeddings (file_id, dim, vector)
+		SELECT id, ?, ? FROM files WHERE path = ?;`,
+		len(vector), blob, path,
+	)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	_, err = tx.Exec(`UPDATE files SET embedded_at = ? WHERE path = ?;`, embeddedAt, path)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetAllEmbeddings loads every stored vector with its file metadata
+// in one JOIN — the brute-force semantic scan reads this whole set.
+// Vectors decode (and dim-check) here so bad rows fail loudly at load,
+// never as silent mis-scores mid-search.
+func GetAllEmbeddings(database *sql.DB) ([]StoredEmbedding, error) {
+	rows, err := database.Query(`
+	SELECT
+		files.path, files.name, files.extension, files.size_bytes,
+		files.modified_at, files.created_at, files.indexed_at, files.content_hash,
+		files.content, files.content_extracted_at, files.embedded_at,
+		embeddings.dim, embeddings.vector
+	FROM embeddings
+	JOIN files ON files.id = embeddings.file_id;
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []StoredEmbedding
+	for rows.Next() {
+		var se StoredEmbedding
+		var dim int
+		var blob []byte
+		if err := rows.Scan(
+			&se.Record.Path,
+			&se.Record.Name,
+			&se.Record.Extension,
+			&se.Record.SizeBytes,
+			&se.Record.ModifiedAt,
+			&se.Record.CreatedAt,
+			&se.Record.IndexedAt,
+			&se.Record.ContentHash,
+			&se.Record.Content,
+			&se.Record.ContentExtractedAt,
+			&se.Record.EmbeddedAt,
+			&dim,
+			&blob,
+		); err != nil {
+			return nil, err
+		}
+		vec, err := decodeVector(blob, dim)
+		if err != nil {
+			return nil, fmt.Errorf("corrupt embedding for %s: %w", se.Record.Path, err)
+		}
+		se.Vector = vec
+		out = append(out, se)
+	}
+	return out, rows.Err()
+}
+
+// EmbeddingStatus reports whether path already has an embedding newer
+// than (or equal to) the given content timestamp — the scanner's
+// freshness check for skipping unchanged files. ok=false means "embed
+// it"; a nil embeddedAt also means "embed it".
+func EmbeddingStatus(database *sql.DB, path string, contentTs int64) (ok bool, err error) {
+	var embeddedAt sql.NullInt64
+	err = database.QueryRow(`SELECT embedded_at FROM files WHERE path = ?;`, path).Scan(&embeddedAt)
+	if err != nil {
+		return false, err
+	}
+	return embeddedAt.Valid && embeddedAt.Int64 >= contentTs, nil
+}
+
+// encodeVector serializes a []float32 to little-endian bytes.
+// encoding/binary (not unsafe casts) keeps this portable across
+// architectures — endianness is explicit, not assumed.
+func encodeVector(vec []float32) ([]byte, error) {
+	if len(vec) == 0 {
+		return nil, fmt.Errorf("cannot store empty embedding vector")
+	}
+	blob := make([]byte, 4*len(vec))
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(blob[i*4:], math.Float32bits(v))
+	}
+	return blob, nil
+}
+
+// decodeVector is encodeVector in reverse, with the dim cross-check
+// that catches model swaps (a 768-dim row read as 384 would otherwise
+// silently score garbage).
+func decodeVector(blob []byte, dim int) ([]float32, error) {
+	if dim <= 0 {
+		return nil, fmt.Errorf("invalid stored dimension %d", dim)
+	}
+	if len(blob) != 4*dim {
+		return nil, fmt.Errorf("blob is %d bytes, want %d for dim %d", len(blob), 4*dim, dim)
+	}
+	vec := make([]float32, dim)
+	for i := range vec {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
+	}
+	return vec, nil
 }
 
 // toFTSMatch converts raw user input into a safe FTS5 MATCH expression.
