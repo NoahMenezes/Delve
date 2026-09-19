@@ -59,7 +59,7 @@ func SemanticSearch(database *sql.DB, query string, limit int) ([]Hit, error) {
 			return nil, fmt.Errorf("embedding dimension mismatch for %s: stored %d, query %d (re-scan to re-embed)",
 				se.Record.Path, len(se.Vector), len(queryVec))
 		}
-		hits = append(hits, Hit{Record: se.Record, Score: cosine(queryVec, se.Vector)})
+		hits = append(hits, Hit{Record: se.Record, Score: Cosine(queryVec, se.Vector)})
 	}
 
 	// Descending score — most similar first (opposite of FTS's
@@ -71,15 +71,19 @@ func SemanticSearch(database *sql.DB, query string, limit int) ([]Hit, error) {
 	return hits, nil
 }
 
-// cosine returns the cosine similarity of two vectors: the cosine of
+// Cosine returns the cosine similarity of two vectors: the cosine of
 // the angle between them, 1 = identical direction, 0 = orthogonal
 // (unrelated), -1 = opposite. Formula: dot(a,b) / (|a|*|b|).
+//
+// Exported (not just used by SemanticSearch) so organize clustering
+// shares the single definition of "similar" — one source of truth.
 //
 // The shortcut that makes this cheap: embed.GenerateEmbedding L2-
 // normalizes every stored vector at write time (|v| = 1), so the
 // denominator vanishes and cosine reduces to a plain dot product.
 // One loop, one multiply-add per dimension, no sqrt per comparison.
-func cosine(a, b []float32) float64 {
+// Callers must pass equal-length L2-normalized vectors.
+func Cosine(a, b []float32) float64 {
 	var dot float64
 	for i := range a {
 		dot += float64(a[i]) * float64(b[i])

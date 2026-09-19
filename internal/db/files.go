@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"path/filepath"
 )
 
 // fileColumns is the canonical 11-column files SELECT list, shared by
@@ -36,7 +37,31 @@ func scanFileRecord(rows *sql.Rows, rec *FileRecord, extra ...any) error {
 	return rows.Scan(append(dests, extra...)...)
 }
 
-// UpsertFile inserts a file row, or updates it if the path already
+// ListFiles returns every indexed file under root (including root
+// itself if it's a file row), ordered by path. Powers index-wide
+// features like organize suggestions that must see unembedded rows
+// too — GetAllEmbeddings only covers files with vectors.
+func ListFiles(database *sql.DB, root string) ([]FileRecord, error) {
+	rows, err := database.Query(
+		"SELECT "+fileColumns+" FROM files WHERE path = ? OR path LIKE ? ORDER BY path;",
+		root, root+string(filepath.Separator)+"%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []FileRecord
+	for rows.Next() {
+		var rec FileRecord
+		if err := scanFileRecord(rows, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // exists. SQLite's ON CONFLICT(path) DO UPDATE (an "upsert", needs
 // SQLite 3.24+) is what makes re-scans cheap and idempotent: run the
 // scan twice, still one row per file, with fresh timestamps.
