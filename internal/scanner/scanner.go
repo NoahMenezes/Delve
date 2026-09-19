@@ -42,10 +42,73 @@ var skipDirs = map[string]bool{
 // one boolean per phase (verbose, extractContent, now embed) until
 // positional bools became unreadable — this struct is the graduation
 // the Phase 3 comment promised. New phases add fields, not params.
+// The watcher reuses it directly so watch and scan share one pipeline.
 type ScanOptions struct {
 	Verbose        bool // print each indexed path instead of a counter
 	ExtractContent bool // Phase 3: extract txt/md/pdf/docx text
 	Embed          bool // Phase 4: embed extracted text for semantic search
+}
+
+// ShouldSkipDir reports whether a directory base name is on the
+// blocklist (VCS data, dependency caches, build output, .delve).
+// Exported so the watcher shares the single skip list instead of
+// duplicating it and drifting.
+func ShouldSkipDir(name string) bool {
+	return skipDirs[name]
+}
+
+// ScanFile indexes one file: stats it, skips symlinks/non-regular
+// files silently, upserts metadata, then extracts/embeds when
+// enabled. It is the single-file pipeline shared by ScanDirectory's
+// walk and the live watcher — fix indexing logic here, not in both
+// callers. Returns indexed=false,nil for skips (symlink, dir,
+// non-regular, missing is an error, see below).
+//
+// Missing files return an error (the watcher treats that as
+// "already gone, delete the row" instead of a crash). Upsert
+// failures return an error; extraction/embedding failures only warn
+// (via extractFile/embedFile) and still count as indexed, because a
+// file with broken content must remain searchable by name.
+func ScanFile(database *sql.DB, path string, opts ScanOptions) (indexed bool, err error) {
+	// Lstat (not Stat) so symlinks are seen, not followed —
+	// following links risks cycles (A -> B -> A) and indexing one
+	// file under many paths.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if opts.Verbose {
+			fmt.Printf("skipping symlink: %s\n", path)
+		}
+		return false, nil
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+
+	// Abs keeps stored paths stable no matter where the user runs
+	// from — same rule as ScanDirectory's walk.
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+
+	rec := toFileRecord(absPath, info)
+	if err := db.UpsertFile(database, rec); err != nil {
+		return false, err
+	}
+
+	// Same ordering as the walk: metadata first (fallible content
+	// step must never block name indexing), extraction records
+	// tried-and-failed so bad files aren't retried blindly.
+	if opts.ExtractContent && extract.IsSupported(rec.Extension) {
+		extractFile(database, absPath, path, rec.Extension, opts)
+	}
+	return true, nil
 }
 
 // ScanDirectory walks root recursively and upserts every regular file
@@ -95,9 +158,10 @@ func ScanDirectory(root string, opts ScanOptions) (fileCount int, err error) {
 
 		// Prune noise directories before descending. entry.IsDir
 		// is cheap (no stat call); SkipDir tells WalkDir to skip
-		// the entire subtree.
+		// the entire subtree. ShouldSkipDir is the shared blocklist
+		// the watcher also uses.
 		if entry.IsDir() {
-			if skipDirs[entry.Name()] {
+			if ShouldSkipDir(entry.Name()) {
 				if opts.Verbose {
 					fmt.Printf("skipping directory: %s\n", path)
 				}
@@ -106,60 +170,27 @@ func ScanDirectory(root string, opts ScanOptions) (fileCount int, err error) {
 			return nil
 		}
 
-		// Skip symlinks for now. A symlink's DirEntry reports its
-		// own type, and following links risks cycles (A -> B -> A)
-		// and double-indexing one file under many paths. Explicit
-		// symlink-following (with cycle detection) is a later-phase
-		// feature, not Phase 1 scope.
-		// KNOWN LIMITATION: symlinked files AND symlinked dirs are
-		// both skipped, so files reachable only via symlink are
-		// invisible to search until that feature lands.
-		if entry.Type()&fs.ModeSymlink != 0 {
-			if opts.Verbose {
-				fmt.Printf("skipping symlink: %s\n", path)
-			}
-			return nil
-		}
-
-		// entry.Info() does stat the file (one syscall) — this is
-		// where permission errors on individual files surface.
-		fileInfo, err := entry.Info()
+		// All file indexing flows through ScanFile — the same
+		// pipeline the watcher calls per event. The walk only
+		// handles traversal (dirs, walk errors, counting); ScanFile
+		// owns stat/skip/upsert/extract. One extra Lstat per file
+		// vs the old inline Info() path is negligible next to
+		// extraction + embedding.
+		indexed, err := ScanFile(database, path, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", path, err)
 			return nil
 		}
-		// Belt-and-suspenders: non-regular files (devices, sockets,
-		// pipes) have no meaningful size/mtime for our index.
-		if !fileInfo.Mode().IsRegular() {
+		if !indexed {
 			return nil
-		}
-
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", path, err)
-			return nil
-		}
-
-		rec := toFileRecord(absPath, fileInfo)
-		if err := db.UpsertFile(database, rec); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not index %s: %v\n", path, err)
-			return nil
-		}
-
-		// Phase 3: extract document text for supported formats. This
-		// runs AFTER the metadata upsert on purpose — extraction is
-		// the fallible part (corrupt PDFs, unreadable zips), and a
-		// file with broken content must still be indexed by name.
-		// Failures record (nil content + timestamp) so the database
-		// distinguishes "tried and failed" from "not yet tried" and
-		// doesn't waste work retrying known-bad files every scan.
-		if opts.ExtractContent && extract.IsSupported(rec.Extension) {
-			extractFile(database, absPath, path, rec.Extension, opts)
 		}
 
 		fileCount++
 		if opts.Verbose {
-			fmt.Printf("indexed: %s\n", absPath)
+			if abs, err := filepath.Abs(path); err == nil {
+				path = abs
+			}
+			fmt.Printf("indexed: %s\n", path)
 		} else {
 			// \r rewrites the same terminal line so a 100k-file
 			// scan shows a live counter instead of 100k lines.

@@ -140,6 +140,42 @@ func GetFileContentHash(database *sql.DB, path string) string {
 	return hash.String
 }
 
+// DeleteFile removes one indexed path and its embedding vector, if
+// any. The files_ad trigger deletes the row's FTS tokens
+// automatically, so keyword search forgets the file with no extra
+// work. Returns deleted=false,nil when the path was never indexed —
+// the watcher logs that as "ignored", not an error, because
+// create-then-delete races make it routine.
+func DeleteFile(database *sql.DB, path string) (deleted bool, err error) {
+	tx, err := database.Begin()
+	if err != nil {
+		return false, err
+	}
+	// Embeddings reference files.id (no enforced FK — see schema.go),
+	// so delete the vector first via the path's row id, then the row.
+	if _, err := tx.Exec(
+		`DELETE FROM embeddings WHERE file_id = (SELECT id FROM files WHERE path = ?);`,
+		path,
+	); err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	res, err := tx.Exec(`DELETE FROM files WHERE path = ?;`, path)
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // GetFileCount returns the total rows in `files` — a quick sanity
 // check after a scan ("did anything actually get indexed?").
 func GetFileCount(database *sql.DB) (int, error) {
