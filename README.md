@@ -57,8 +57,9 @@ stays disabled — the engine is dry-run only, and the GUI must not imply
 otherwise.
 
 Honest packaging note: unlike the CLI's single static binary, the GUI links
-the system WebKitGTK on Linux, and Node is required at *build* time (never at
-runtime). The CLI remains the primary artifact.
+the system WebKitGTK on Linux, and Bun (JS runtime/package manager, build
+time only — never at runtime) is required to build the React frontend.
+The CLI remains the primary artifact.
 
 ```bash
 # Linux system dependency (WebKitGTK) — required for wails dev/build:
