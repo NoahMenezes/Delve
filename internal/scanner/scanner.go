@@ -4,7 +4,9 @@
 package scanner
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -152,29 +154,7 @@ func ScanDirectory(root string, opts ScanOptions) (fileCount int, err error) {
 		// distinguishes "tried and failed" from "not yet tried" and
 		// doesn't waste work retrying known-bad files every scan.
 		if opts.ExtractContent && extract.IsSupported(rec.Extension) {
-			text, err := extract.ExtractText(absPath, rec.Extension)
-			now := time.Now().Unix()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not extract content from %s: %v\n", path, err)
-				if uerr := db.UpdateFileContent(database, absPath, nil, now); uerr != nil {
-					fmt.Fprintf(os.Stderr, "warning: could not record extraction failure for %s: %v\n", path, uerr)
-				}
-			} else {
-				if uerr := db.UpdateFileContent(database, absPath, &text, now); uerr != nil {
-					fmt.Fprintf(os.Stderr, "warning: could not store content for %s: %v\n", path, uerr)
-				} else {
-					if opts.Verbose {
-						fmt.Printf("extracted content: %s (%d chars)\n", absPath, len([]rune(text)))
-					}
-					// Phase 4: embed freshly extracted text for semantic
-					// search. Empty text (e.g. scanned PDFs) has nothing
-					// to embed — skip it, but its extracted_at stamp
-					// stands so we don't retry every scan.
-					if opts.Embed && strings.TrimSpace(text) != "" {
-						embedFile(database, absPath, text, now, opts.Verbose)
-					}
-				}
-			}
+			extractFile(database, absPath, path, rec.Extension, opts)
 		}
 
 		fileCount++
@@ -202,22 +182,57 @@ func ScanDirectory(root string, opts ScanOptions) (fileCount int, err error) {
 	return fileCount, nil
 }
 
-// embedFile generates and stores a file's meaning vector. It first
-// asks the database whether an embedding newer than this content
-// already exists — rescans of unchanged files skip the (millisecond,
-// but nonzero) inference cost. Embed failures warn and continue: a
-// file without a vector is simply invisible to semantic search, still
-// fully searchable by keyword.
-func embedFile(database *sql.DB, absPath, text string, contentTs int64, verbose bool) {
-	fresh, err := db.EmbeddingStatus(database, absPath, contentTs)
+// extractFile extracts one file's text, stores it unless unchanged,
+// and embeds it when appropriate. Change detection comes first: if
+// the new text hashes equal to the stored hash, the UPDATE is skipped
+// entirely (no pointless FTS re-index), and embedding runs only when
+// no vector exists yet (e.g. a previous --embed=false scan).
+func extractFile(database *sql.DB, absPath, displayPath, extension string, opts ScanOptions) {
+	text, err := extract.ExtractText(absPath, extension)
+	now := time.Now().Unix()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not check embedding status for %s: %v\n", absPath, err)
-	} else if fresh {
-		if verbose {
-			fmt.Printf("embedding fresh, skipping: %s\n", absPath)
+		fmt.Fprintf(os.Stderr, "warning: could not extract content from %s: %v\n", displayPath, err)
+		if uerr := db.UpdateFileContent(database, absPath, nil, nil, now); uerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record extraction failure for %s: %v\n", displayPath, uerr)
 		}
 		return
 	}
+
+	sum := sha256.Sum256([]byte(text))
+	hash := hex.EncodeToString(sum[:])
+	if stored := db.GetFileContentHash(database, absPath); stored != "" && stored == hash {
+		if opts.Verbose {
+			fmt.Printf("content unchanged, skipping: %s\n", absPath)
+		}
+		// Content identical — but a vector may still be missing.
+		if opts.Embed && strings.TrimSpace(text) != "" {
+			if fresh, err := db.EmbeddingStatus(database, absPath, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not check embedding status for %s: %v\n", absPath, err)
+			} else if !fresh {
+				embedFile(database, absPath, text, opts.Verbose)
+			}
+		}
+		return
+	}
+
+	if uerr := db.UpdateFileContent(database, absPath, &text, &hash, now); uerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not store content for %s: %v\n", displayPath, uerr)
+		return
+	}
+	if opts.Verbose {
+		fmt.Printf("extracted content: %s (%d chars)\n", absPath, len([]rune(text)))
+	}
+	// Empty text (e.g. scanned PDFs) has nothing to embed — skip it,
+	// but its extracted_at stamp stands so we don't retry every scan.
+	if opts.Embed && strings.TrimSpace(text) != "" {
+		embedFile(database, absPath, text, opts.Verbose)
+	}
+}
+
+// embedFile generates and stores a file's meaning vector. Embed
+// failures warn and continue: a file without a vector is simply
+// invisible to semantic search, still fully searchable by keyword.
+func embedFile(database *sql.DB, absPath, text string, verbose bool) {
 	vec, err := embed.GenerateEmbedding(text)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not embed %s: %v\n", absPath, err)
@@ -258,6 +273,6 @@ func toFileRecord(absPath string, info fs.FileInfo) db.FileRecord {
 		ModifiedAt:  modTime.Unix(),
 		CreatedAt:   createdAt.Unix(),
 		IndexedAt:   now,
-		ContentHash: nil, // Phase 1: metadata only, hashing comes later
+		ContentHash: nil, // INSERT-time only; UpdateFileContent owns the hash afterwards (see db.UpsertFile note)
 	}
 }

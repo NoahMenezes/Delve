@@ -348,10 +348,12 @@ func migrateFTSShape(database *sql.DB) error {
 // SQLite 3.24+) is what makes re-scans cheap and idempotent: run the
 // scan twice, still one row per file, with fresh timestamps.
 //
-// NOTE: content and content_extracted_at are deliberately ABSENT from
-// the DO UPDATE clause. Metadata rescans (especially with
-// --extract-content=false) must never wipe previously extracted text;
-// content writes go exclusively through UpdateFileContent.
+// NOTE: content, content_hash, and content_extracted_at are
+// deliberately ABSENT from the DO UPDATE clause. Metadata rescans
+// (especially with --extract-content=false) must never wipe extracted
+// text or its change-detection hash — wiping the hash would defeat
+// skip-if-unchanged logic and force full re-extraction every scan.
+// Content writes go exclusively through UpdateFileContent.
 func UpsertFile(database *sql.DB, rec FileRecord) error {
 	const query = `
 	INSERT INTO files
@@ -364,8 +366,7 @@ func UpsertFile(database *sql.DB, rec FileRecord) error {
 		size_bytes   = excluded.size_bytes,
 		modified_at  = excluded.modified_at,
 		created_at   = excluded.created_at,
-		indexed_at   = excluded.indexed_at,
-		content_hash = excluded.content_hash;
+		indexed_at   = excluded.indexed_at;
 	`
 	// database/sql uses ? placeholders for sqlite (not $1 like Postgres).
 	_, err := database.Exec(
@@ -385,16 +386,40 @@ func UpsertFile(database *sql.DB, rec FileRecord) error {
 }
 
 // UpdateFileContent stores (or clears, with nil) a file's extracted
-// text and stamps the attempt time. The scanner calls it after every
-// extraction attempt — success AND failure — so content_extracted_at
-// always means "last tried". The UPDATE fires the files_au trigger,
-// re-indexing the row's content tokens in FTS automatically.
-func UpdateFileContent(database *sql.DB, path string, content *string, extractedAt int64) error {
+// text, its content hash, and stamps the attempt time. The scanner
+// calls it after every extraction attempt — success AND failure — so
+// content_extracted_at always means "last tried". The UPDATE fires the
+// files_au trigger, re-indexing the row's content tokens in FTS
+// automatically.
+//
+// CONTENT_HASH, explained: since Phase 4 this holds the SHA-256 hex of
+// the *extracted text* (not raw file bytes — PDFs embed timestamps and
+// ids that change without the text changing). The scanner compares it
+// before writing: identical hash means "content unchanged", skipping
+// both the UPDATE (which would pointlessly re-index FTS) and
+// re-embedding. This is the cheap change-detection Phase 1 reserved
+// the column for. A nil hash (extraction failure) never matches, so
+// failed files retry next scan.
+func UpdateFileContent(database *sql.DB, path string, content *string, hash *string, extractedAt int64) error {
 	_, err := database.Exec(
-		`UPDATE files SET content = ?, content_extracted_at = ? WHERE path = ?;`,
-		content, extractedAt, path,
+		`UPDATE files SET content = ?, content_hash = ?, content_extracted_at = ? WHERE path = ?;`,
+		content, hash, extractedAt, path,
 	)
 	return err
+}
+
+// GetFileContentHash returns the stored text hash for path, or "" when
+// the row is missing, never extracted, or last failed. The scanner
+// uses it to skip unchanged files without touching them.
+func GetFileContentHash(database *sql.DB, path string) string {
+	var hash sql.NullString
+	if err := database.QueryRow(`SELECT content_hash FROM files WHERE path = ?;`, path).Scan(&hash); err != nil {
+		return ""
+	}
+	if !hash.Valid {
+		return ""
+	}
+	return hash.String
 }
 
 // GetFileCount returns the total rows in `files` — a quick sanity
