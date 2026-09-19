@@ -7,3 +7,8 @@
 
 # Build / tooling noise
 __debug_bin*
+
+# Wails GUI artifacts (built, not tracked)
+gui/frontend/dist/
+gui/frontend/node_modules/
+gui/build/
