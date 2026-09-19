@@ -1,0 +1,9 @@
+# Binaries
+/delve
+/delve.exe
+
+# SQLite test artifacts
+*.db
+
+# Build / tooling noise
+__debug_bin*
