@@ -3,6 +3,7 @@ module github.com/NoahMenezes/Delve
 go 1.26.8
 
 require (
+	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/spf13/cobra v1.10.2
 )

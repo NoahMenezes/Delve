@@ -1,6 +1,6 @@
 // Package scanner walks a directory tree and upserts file metadata
-// into Delve's SQLite index. Phase 1 scope: metadata only —
-// no file contents are opened or read.
+// into Delve's SQLite index, optionally extracting document text
+// (Phase 3) for supported formats.
 package scanner
 
 import (
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NoahMenezes/Delve/internal/db"
+	"github.com/NoahMenezes/Delve/internal/extract"
 )
 
 // skipDirs is the small, easily-extensible blocklist of directory
@@ -39,12 +40,15 @@ var skipDirs = map[string]bool{
 // The verbose flag controls per-file output: false prints just a
 // running count (one line, overwritten in place), true prints each
 // indexed path on its own line (useful for debugging, noisy at scale).
+// The extractContent flag enables Phase 3 text extraction for
+// supported formats (txt/md/pdf/docx) — disable it for faster
+// metadata-only scans of large trees.
 //
-// NOTE on the signature: the Phase 1 brief sketched
-// ScanDirectory(root string), but verbose lives here (rather than in
-// cmd/) so the progress-printing policy stays with the walk logic
-// and stays testable in one place.
-func ScanDirectory(root string, verbose bool) (fileCount int, err error) {
+// NOTE on the signature: it grows one flag per phase (verbose in
+// Phase 2, extractContent now) to keep call sites readable without an
+// options struct — a deliberate minimalism tradeoff; if a fourth flag
+// ever arrives, graduate to a ScanOptions struct.
+func ScanDirectory(root string, verbose bool, extractContent bool) (fileCount int, err error) {
 	// Resolve early: filepath.WalkDir would otherwise report a
 	// confusing error deep inside the walk for a bad root.
 	info, err := os.Stat(root)
@@ -138,6 +142,30 @@ func ScanDirectory(root string, verbose bool) (fileCount int, err error) {
 		if err := db.UpsertFile(database, rec); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not index %s: %v\n", path, err)
 			return nil
+		}
+
+		// Phase 3: extract document text for supported formats. This
+		// runs AFTER the metadata upsert on purpose — extraction is
+		// the fallible part (corrupt PDFs, unreadable zips), and a
+		// file with broken content must still be indexed by name.
+		// Failures record (nil content + timestamp) so the database
+		// distinguishes "tried and failed" from "not yet tried" and
+		// doesn't waste work retrying known-bad files every scan.
+		if extractContent && extract.IsSupported(rec.Extension) {
+			text, err := extract.ExtractText(absPath, rec.Extension)
+			now := time.Now().Unix()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not extract content from %s: %v\n", path, err)
+				if uerr := db.UpdateFileContent(database, absPath, nil, now); uerr != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not record extraction failure for %s: %v\n", path, uerr)
+				}
+			} else {
+				if uerr := db.UpdateFileContent(database, absPath, &text, now); uerr != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not store content for %s: %v\n", path, uerr)
+				} else if verbose {
+					fmt.Printf("extracted content: %s (%d chars)\n", absPath, len([]rune(text)))
+				}
+			}
 		}
 
 		fileCount++

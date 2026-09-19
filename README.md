@@ -31,8 +31,8 @@ go build -tags fts5 -o delve .
 ## Usage (so far)
 
 ```bash
-delve scan [path] [--verbose]   # index file metadata (default: current dir)
-delve search <query> [--limit 20] [--extension pdf]  # keyword search names/paths
+delve scan [path] [--verbose] [--extract-content=true]  # index metadata + text (default: current dir)
+delve search <query> [--limit 20] [--extension pdf]     # keyword search names/paths/content
 ```
 
 The index lives at `~/.delve/delve.db` (plain SQLite — inspect it with the
@@ -42,9 +42,11 @@ The index lives at `~/.delve/delve.db` (plain SQLite — inspect it with the
 
 - [x] **Phase 1: core directory scanner + SQLite metadata index** ✅
 - [x] **Phase 2: keyword search via FTS5** ✅ (filename/path matching)
-- [ ] **Phase 3: content extraction** — text from pdf, docx, txt, md, **plus OCR
-  for images/screenshots** (a screenshots-heavy folder proves text-only isn't
-  enough)
+- [x] **Phase 3: content extraction** ✅ — text from txt, md, pdf
+  (`ledongthuc/pdf`, pure Go), docx (stdlib zip+XML). Capped at 50,000 chars
+  per file; scanned/image PDFs yield no text (no OCR in this phase)
+- [ ] **Phase 3.5: OCR for images/screenshots** — a screenshots-heavy folder
+  proves text-only isn't enough
 - [ ] **Phase 4: local semantic search via embeddings** — offline,
   meaning-based search (pure-Go / Go-native ONNX runtime only)
 - [ ] **Phase 5: smart organization suggestions** — dry-run previews only,

@@ -22,9 +22,9 @@ var (
 // searchCmd represents the search command
 var searchCmd = &cobra.Command{
 	Use:   "search [query]",
-	Short: "Keyword-search indexed file names and paths",
-	Long: `Full-text search across indexed file names and paths using
-SQLite FTS5 — no file contents involved in this phase.
+	Short: "Keyword-search indexed file names, paths, and contents",
+	Long: `Full-text search across indexed file names, paths, and
+extracted document content (txt/md/pdf/docx) using SQLite FTS5.
 
 Examples:
   delve search invoice
@@ -52,7 +52,7 @@ Examples:
 
 		if len(results) == 0 {
 			fmt.Printf("No results for %q.\n", query)
-			fmt.Println("Tip: search matches file names and paths (not contents yet). Try `delve scan <dir>` if the file isn't indexed.")
+			fmt.Println("Tip: search matches file names, paths, and extracted document text. Try `delve scan <dir>` if the file isn't indexed.")
 			return nil
 		}
 

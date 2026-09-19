@@ -45,6 +45,15 @@ type FileRecord struct {
 	CreatedAt   int64   // birth time if known, else falls back to mtime
 	IndexedAt   int64   // when Delve last saw this file, Unix seconds
 	ContentHash *string // nil in Phase 1; reserved for later phases
+	// Content is the extracted document text (Phase 3+), nil when none
+	// is stored. ContentExtractedAt is the Unix time of the last
+	// extraction *attempt*, and the two NULLs together encode state:
+	//   nil, nil + supported extension  = not yet tried
+	//   timestamp + nil content         = tried and failed (don't retry blindly)
+	//   timestamp + text                = extracted successfully
+	//   nil, nil + unsupported extension = not applicable (by definition)
+	Content            *string
+	ContentExtractedAt *int64
 }
 
 // DefaultDBPath returns ~/.delve/delve.db.
@@ -141,18 +150,67 @@ func createSchema(database *sql.DB) error {
 	if _, err := database.Exec(schema); err != nil {
 		return err
 	}
-	return createFTSSchema(database)
+	// Phase 3 columns must exist before the FTS layer references them.
+	if err := migrateContentColumns(database); err != nil {
+		return err
+	}
+	return ensureFTSSchema(database)
 }
 
-// createFTSSchema creates the FTS5 full-text index over file names and
-// paths, plus the triggers that keep it in sync. Also idempotent.
+// migrateContentColumns adds Phase 3's content columns to databases
+// created by earlier phases. Fresh databases take the same path — the
+// base schema above intentionally omits the new columns so there is
+// exactly one code path. (SQLite has no ADD COLUMN IF NOT EXISTS, so
+// we inspect PRAGMA table_info first; the whole migration is
+// idempotent and a half-finished run simply completes next open.)
+func migrateContentColumns(database *sql.DB) error {
+	cols, err := tableColumns(database, "files")
+	if err != nil {
+		return err
+	}
+	if !cols["content"] {
+		if _, err := database.Exec(`ALTER TABLE files ADD COLUMN content TEXT;`); err != nil {
+			return err
+		}
+	}
+	if !cols["content_extracted_at"] {
+		if _, err := database.Exec(`ALTER TABLE files ADD COLUMN content_extracted_at INTEGER;`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tableColumns returns the current column set of a table via
+// PRAGMA table_info — the standard introspection idiom for
+// "does this column exist yet?" migration checks.
+func tableColumns(database *sql.DB, table string) (map[string]bool, error) {
+	rows, err := database.Query(`SELECT name FROM pragma_table_info(?);`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// ensureFTSSchema creates the FTS5 full-text index over file names,
+// paths, AND document content (Phase 3 adds content), plus the
+// triggers that keep it in sync.
 //
 // FTS5 EXTERNAL CONTENT TABLES, explained: a normal FTS5 table stores
 // its own copy of the text. With content='files', content_rowid='id',
 // the FTS table instead *references* our existing `files` table — the
 // indexed text lives in exactly one place. files_fts only holds the
-// inverted index (token -> row); the real name/path strings are read
-// from `files` at query time. No duplication, no drift.
+// inverted index (token -> row); the real strings are read from
+// `files` at query time. No duplication, no drift.
 //
 // TRIGGER SYNC, explained: SQLite does NOT auto-update an FTS index
 // when the content table changes — we must do it with triggers.
@@ -160,35 +218,76 @@ func createSchema(database *sql.DB) error {
 // row's tokens via FTS5's special 'delete' command (that odd-looking
 // INSERT with the table name as the first value is FTS5 syntax meaning
 // "forget everything indexed under this rowid"); AFTER UPDATE does
-// delete-then-insert because either column may have changed. From then
-// on, every UpsertFile automatically maintains the index — the scanner
-// and search code never touch files_fts directly.
-func createFTSSchema(database *sql.DB) error {
-	const fts = `
-	CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-		name, path, content='files', content_rowid='id'
-	);
-	CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-		INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
-	END;
-	CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-		INSERT INTO files_fts(files_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
-	END;
-	CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-		INSERT INTO files_fts(files_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
-		INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
-	END;
-	`
-	if _, err := database.Exec(fts); err != nil {
+// delete-then-insert because any column may have changed. From then
+// on, every UpsertFile/UpdateFileContent automatically maintains the
+// index — the scanner and search code never touch files_fts directly.
+//
+// MIGRATION, explained: you cannot ALTER a virtual table, so adding
+// the content column means drop-and-recreate. We detect the old shape
+// by reading the table's own CREATE statement from sqlite_master: if
+// files_fts is missing or lacks a content column, we drop the three
+// triggers FIRST (old bodies reference the old 3-column shape and
+// would break every write the moment the table changes), drop the FTS
+// table (its shadow tables go with it), recreate everything, and run
+// one 'rebuild' to re-index all rows. If the shape is already current,
+// triggers are ensured with IF NOT EXISTS and no rebuild runs —
+// important, because InitDB opens on every command and rebuilding the
+// content index on every `delve search` would be pure waste.
+func ensureFTSSchema(database *sql.DB) error {
+	var ftsSQL sql.NullString
+	err := database.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE name = 'files_fts';`,
+	).Scan(&ftsSQL)
+	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
+	if !ftsSQL.Valid || !strings.Contains(ftsSQL.String, "content, content=") {
+		return migrateFTSShape(database)
+	}
 
-	// Backfill: triggers only fire on writes that happen AFTER they
-	// are created, so rows indexed before this migration (e.g. by a
-	// Phase 1 scan) would be invisible to search. 'rebuild' re-indexes
-	// every row of `files` from scratch. It is idempotent, so running
-	// it on every open is safe; tables here are small (metadata only).
-	_, err := database.Exec(`INSERT INTO files_fts(files_fts) VALUES('rebuild');`)
+	// Shape is current: self-heal missing triggers (e.g. user deleted
+	// one by hand) without touching the index.
+	const triggers = `
+	CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+		INSERT INTO files_fts(rowid, name, path, content) VALUES (new.id, new.name, new.path, new.content);
+	END;
+	CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+		INSERT INTO files_fts(files_fts, rowid, name, path, content) VALUES ('delete', old.id, old.name, old.path, old.content);
+	END;
+	CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+		INSERT INTO files_fts(files_fts, rowid, name, path, content) VALUES ('delete', old.id, old.name, old.path, old.content);
+		INSERT INTO files_fts(rowid, name, path, content) VALUES (new.id, new.name, new.path, new.content);
+	END;
+	`
+	_, err = database.Exec(triggers)
+	return err
+}
+
+// migrateFTSShape drops and recreates the FTS index with the current
+// column set, then rebuilds it from `files`. Runs once per shape
+// change (Phase 2 -> Phase 3); every later open takes the cheap path.
+func migrateFTSShape(database *sql.DB) error {
+	const migration = `
+	DROP TRIGGER IF EXISTS files_ai;
+	DROP TRIGGER IF EXISTS files_ad;
+	DROP TRIGGER IF EXISTS files_au;
+	DROP TABLE IF EXISTS files_fts;
+	CREATE VIRTUAL TABLE files_fts USING fts5(
+		name, path, content, content='files', content_rowid='id'
+	);
+	CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+		INSERT INTO files_fts(rowid, name, path, content) VALUES (new.id, new.name, new.path, new.content);
+	END;
+	CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+		INSERT INTO files_fts(files_fts, rowid, name, path, content) VALUES ('delete', old.id, old.name, old.path, old.content);
+	END;
+	CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+		INSERT INTO files_fts(files_fts, rowid, name, path, content) VALUES ('delete', old.id, old.name, old.path, old.content);
+		INSERT INTO files_fts(rowid, name, path, content) VALUES (new.id, new.name, new.path, new.content);
+	END;
+	INSERT INTO files_fts(files_fts) VALUES('rebuild');
+	`
+	_, err := database.Exec(migration)
 	return err
 }
 
@@ -196,12 +295,17 @@ func createFTSSchema(database *sql.DB) error {
 // exists. SQLite's ON CONFLICT(path) DO UPDATE (an "upsert", needs
 // SQLite 3.24+) is what makes re-scans cheap and idempotent: run the
 // scan twice, still one row per file, with fresh timestamps.
+//
+// NOTE: content and content_extracted_at are deliberately ABSENT from
+// the DO UPDATE clause. Metadata rescans (especially with
+// --extract-content=false) must never wipe previously extracted text;
+// content writes go exclusively through UpdateFileContent.
 func UpsertFile(database *sql.DB, rec FileRecord) error {
 	const query = `
 	INSERT INTO files
-		(path, name, extension, size_bytes, modified_at, created_at, indexed_at, content_hash)
+		(path, name, extension, size_bytes, modified_at, created_at, indexed_at, content_hash, content, content_extracted_at)
 	VALUES
-		(?, ?, ?, ?, ?, ?, ?, ?)
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		name         = excluded.name,
 		extension    = excluded.extension,
@@ -222,6 +326,21 @@ func UpsertFile(database *sql.DB, rec FileRecord) error {
 		rec.CreatedAt,
 		rec.IndexedAt,
 		rec.ContentHash, // nil *string -> SQL NULL, exactly what we want
+		rec.Content,
+		rec.ContentExtractedAt,
+	)
+	return err
+}
+
+// UpdateFileContent stores (or clears, with nil) a file's extracted
+// text and stamps the attempt time. The scanner calls it after every
+// extraction attempt — success AND failure — so content_extracted_at
+// always means "last tried". The UPDATE fires the files_au trigger,
+// re-indexing the row's content tokens in FTS automatically.
+func UpdateFileContent(database *sql.DB, path string, content *string, extractedAt int64) error {
+	_, err := database.Exec(
+		`UPDATE files SET content = ?, content_extracted_at = ? WHERE path = ?;`,
+		content, extractedAt, path,
 	)
 	return err
 }
@@ -235,11 +354,12 @@ func GetFileCount(database *sql.DB) (int, error) {
 	return count, err
 }
 
-// SearchFiles performs a keyword search over indexed file names and
-// paths using the FTS5 index. Results carry full metadata (joined back
-// from `files`) and are ranked by FTS5's built-in bm25() relevance —
-// best matches first. limit caps the row count; pass extension (e.g.
-// "pdf" or ".pdf") to filter by file type, or "" for no filter.
+// SearchFiles performs a keyword search over indexed file names,
+// paths, AND extracted document content (Phase 3) using the FTS5
+// index. Results carry full metadata (joined back from `files`) and
+// are ranked by FTS5's built-in bm25() relevance — best matches first.
+// limit caps the row count; pass extension (e.g. "pdf" or ".pdf") to
+// filter by file type, or "" for no filter.
 //
 // NOTE on the signature: the Phase 2 brief sketched
 // SearchFiles(query, limit), but the handle and the --extension filter
@@ -263,7 +383,8 @@ func SearchFiles(database *sql.DB, query string, limit int, extension string) ([
 	const base = `
 	SELECT
 		files.path, files.name, files.extension, files.size_bytes,
-		files.modified_at, files.created_at, files.indexed_at, files.content_hash
+		files.modified_at, files.created_at, files.indexed_at, files.content_hash,
+		files.content, files.content_extracted_at
 	FROM files_fts
 	JOIN files ON files.id = files_fts.rowid
 	WHERE files_fts MATCH ?
@@ -295,6 +416,8 @@ func SearchFiles(database *sql.DB, query string, limit int, extension string) ([
 			&rec.CreatedAt,
 			&rec.IndexedAt,
 			&rec.ContentHash,
+			&rec.Content,
+			&rec.ContentExtractedAt,
 		); err != nil {
 			return nil, err
 		}
